@@ -1,0 +1,72 @@
+name: 全自动项目同步机器人
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }} # 确保已在该仓库 Settings 添加 SYNC_PAT
+
+      - name: 配置 Git 环境
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+
+      - name: 同步上游代码及标签
+        env:
+          UPSTREAM_REPO: "SagerNet/sing-box" 
+          GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          git remote remove upstream || true
+          git remote add upstream https://github.com/$UPSTREAM_REPO.git
+          
+          # 1. 获取上游分支
+          UPSTREAM_BRANCH=$(git remote show upstream | grep "HEAD branch" | cut -d' ' -f5)
+          echo "上游主分支是: $UPSTREAM_BRANCH"
+          
+          git fetch upstream $UPSTREAM_BRANCH
+
+          # 2. 【核心修复】使用常规 merge 允许合并不同的历史
+          # 这样能把原作者的 130 个更新和您的 4 个提交（脚本文件）合在一起
+          git checkout main || git checkout -b main
+          git merge upstream/$UPSTREAM_BRANCH --allow-unrelated-histories -m "自动化同步：合入上游更新" || echo "合并存在冲突，尝试自动处理"
+
+          # 3. 推送更新到您的仓库
+          git push origin main --force
+          
+          # 4. 同步标签
+          git fetch upstream --tags
+          git push origin --tags --force
+
+
+      - name: 检查并搬运 Release 附件 (带容错)
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          UPSTREAM_REPO: "SagerNet/sing-box"
+        run: |
+          # 尝试获取最新 Tag，如果失败则说明原厂没有 Release
+          LATEST_TAG=$(gh release view --repo $UPSTREAM_REPO --json tagName --template '{{.tagName}}' 2>/dev/null || echo "")
+          
+          if [ -z "$LATEST_TAG" ]; then
+            echo "上游项目目前没有发布过 Release 或 Tag，跳过附件搬运。"
+            exit 0
+          fi
+
+          if gh release view $LATEST_TAG >/dev/null 2>&1; then
+            echo "版本 $LATEST_TAG 已存在，跳过。"
+          else
+            echo "正在同步版本 $LATEST_TAG 的附件..."
+            mkdir -p ./downloads
+            gh release download $LATEST_TAG --repo $UPSTREAM_REPO --dir ./downloads
+            TITLE=$(gh release view $LATEST_TAG --repo $UPSTREAM_REPO --json name --template '{{.name}}')
+            BODY=$(gh release view $LATEST_TAG --repo $UPSTREAM_REPO --json body --template '{{.body}}')
+            gh release create $LATEST_TAG ./downloads/* --title "$TITLE" --notes "$BODY"
+          fi
