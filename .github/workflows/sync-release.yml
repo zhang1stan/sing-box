@@ -1,0 +1,73 @@
+name: 超强万能项目同步机器人
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: 配置 Git 环境
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+
+      - name: 强力对齐上游 (解决 1000032528 冲突)
+        env:
+          # 【唯一修改处】目标项目
+          UPSTREAM_REPO: "SagerNet/sing-box" 
+          GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          git remote remove upstream || true
+          git remote add upstream https://github.com/$UPSTREAM_REPO.git
+          
+          # 1. 动态检测上游主分支 (如 dev-next)
+          UPSTREAM_BRANCH=$(git remote show upstream | grep "HEAD branch" | cut -d' ' -f5)
+          echo "上游主分支是: $UPSTREAM_BRANCH"
+          git fetch upstream $UPSTREAM_BRANCH
+
+          # 2. 备份你当前的自动化脚本，防止被重置抹除
+          mkdir -p /tmp/sync-scripts
+          cp -r .github/workflows/* /tmp/sync-scripts/
+
+          # 3. 强力重置：强行废弃本地所有冲突，完全对齐原作者
+          git checkout $UPSTREAM_BRANCH || git checkout -b $UPSTREAM_BRANCH
+          git reset --hard upstream/$UPSTREAM_BRANCH
+          
+          # 4. 还原自动化脚本
+          mkdir -p .github/workflows
+          cp -r /tmp/sync-scripts/* .github/workflows/
+          
+          # 5. 提交并强制推送
+          git add .github/workflows/
+          git commit -m "Sync: 强力对齐上游并保留同步脚本" || echo "已经是对齐状态"
+          git push origin $UPSTREAM_BRANCH --force
+          
+          # 6. 同步标签
+          git fetch upstream --tags
+          git push origin --tags --force
+
+      - name: 搬运海量 Release 附件
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          UPSTREAM_REPO: "SagerNet/sing-box"
+        run: |
+          LATEST_TAG=$(gh release view --repo $UPSTREAM_REPO --json tagName --template '{{.tagName}}' 2>/dev/null || echo "")
+          if [ -n "$LATEST_TAG" ] && ! gh release view $LATEST_TAG >/dev/null 2>&1; then
+            echo "发现新版本 $LATEST_TAG，包含 100+ 附件，正在搬运..."
+            mkdir -p ./downloads
+            gh release download $LATEST_TAG --repo $UPSTREAM_REPO --dir ./downloads
+            TITLE=$(gh release view $LATEST_TAG --repo $UPSTREAM_REPO --json name --template '{{.name}}')
+            BODY=$(gh release view $LATEST_TAG --repo $UPSTREAM_REPO --json body --template '{{.body}}')
+            gh release create $LATEST_TAG ./downloads/* --title "$TITLE" --notes "$BODY" --prerelease
+          else
+            echo "无需搬运或已存在。"
+          fi
